@@ -1,0 +1,20 @@
+# Core Deep Learning (Install CUDA 12.4 wheel first for NVIDIA GPUs:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124)
+torch>=2.4.0
+torchvision>=0.19.0
+torchaudio>=2.4.0
+
+# Computer Vision & Detection
+ultralytics>=8.3.0
+opencv-python>=4.10.0
+supervision>=0.22.0
+
+# Signal Processing, Tracking & Audio Fusion
+numpy>=1.26.0
+scipy>=1.13.0
+filterpy>=1.4.5
+librosa>=0.10.2
+
+# Visualization & CLI Utilities
+matplotlib>=3.9.0
+tqdm>=4.66.0

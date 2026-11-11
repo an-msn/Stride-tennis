@@ -1,0 +1,44 @@
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.env
+.venv
+env/
+venv/
+
+# Raw videos, sampled frames & training datasets
+data/raw_videos/*
+data/yt_videos/*
+data/frames_2fps/*
+data/dataset/*
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.wav
+
+# Model weights & Ultralytics training runs
+models/*.pt
+models/*.onnx
+models/*.engine
+runs/
+*.pt
+
+# Cached inference & intermediate JSON blobs
+cache/*.json
+
+# Generated local outputs (keep curated files in assets/ instead)
+outputs/*
+
+# Keep directory structure intact via .gitkeep and allow assets/
+!assets/**
+!**/.gitkeep
+
+# OS & Editor metadata
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

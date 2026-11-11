@@ -1,0 +1,11 @@
+shot_number,stroke_time_sec,impact_time_sec,flight_time_sec,audio_verified,stroke_type,speed_kmh,wall_target_uv,inside_target_quad,unit_turn_ratio,rel_spacing_ratio,knee_angle_deg,posture_note
+1,1.03,1.824,0.7945,False,Forehand,31.6,"[0.612, 0.371]",True,0.01,1.07,143.3,Good athletic spacing & base
+2,2.607,3.499,0.8923,False,Forehand,27.5,"[0.629, 0.554]",True,0.24,1.44,127.0,Strong knee load & unit turn
+3,4.506,5.3,0.794,False,Forehand,31.9,"[0.427, 0.232]",True,0.54,1.46,122.9,Strong knee load & unit turn
+4,7.601,8.093,0.4927,False,Backhand,50.0,"[0.448, 0.322]",True,0.44,1.22,137.0,Strong knee load & unit turn
+5,8.769,9.649,0.8803,False,Backhand,27.9,"[0.382, 0.532]",True,0.03,1.06,128.3,Strong knee load & unit turn
+6,10.657,10.929,0.2713,False,Backhand,89.0,"[0.27, 0.537]",True,0.44,1.28,118.1,Strong knee load & unit turn
+7,11.61,12.14,0.5297,False,Forehand,46.0,"[0.663, 0.618]",True,0.65,1.31,115.7,Strong knee load & unit turn
+8,13.162,14.308,1.1451,False,Forehand,21.9,"[0.646, 0.4]",True,0.02,1.26,142.2,Good athletic spacing & base
+9,15.028,15.877,0.8485,False,Forehand,29.7,"[0.647, 0.313]",True,0.15,1.42,102.4,Strong knee load & unit turn
+10,17.914,18.375,0.4614,False,Backhand,51.6,"[0.419, 0.659]",True,0.46,1.74,135.4,Reaching outside base (move feet)
