@@ -15,22 +15,54 @@ def is_valid_num(val):
     )
 
 
-def filter_valid_rallies(rallies):
+def project_to_wall_square(pt_px, H_wall):
+    """Map image (u, v) coordinate onto the normalized [0, 1] x [0, 1] wall target."""
+    vec = np.array([[[float(pt_px[0]), float(pt_px[1])]]], dtype=np.float32)
+    dst = cv2.perspectiveTransform(vec, np.array(H_wall, dtype=np.float64))[0, 0]
+    return [round(float(dst[0]), 3), round(float(dst[1]), 3)]
+
+
+def filter_valid_rallies(rallies, H_wall=None):
     """
-    Step 6 Rule 1: A ball at the racket must be physically larger in image space
-    than when it reaches the wall (d_stroke > d_wall). Rejects ground-bounce artifacts.
+    Step 6 Rule 1 + Homography Wall Gate:
+    1. A ball at the racket must be physically larger in image space than when it
+       reaches the wall (d_stroke > d_wall). Rejects ground-bounce or mid-air artifacts.
+    2. If H_wall is provided, rejects extreme non-wall impacts (e.g., high fence hits).
     """
     valid = []
     dropped = 0
     for r in rallies:
-        d_s = r["stroke_ball_d_px"]
-        d_w = r["impact_ball_d_px"]
-        if d_s <= d_w * 1.08:
+        d_s = r.get("stroke_ball_d_px", r.get("stroke_d_px", 22.0))
+        d_w = r.get("impact_ball_d_px", r.get("impact_d_px", 11.0))
+        if d_s <= d_w * 1.05:
             dropped += 1
             continue
+
+        if H_wall is not None:
+            uv = project_to_wall_square(r["impact_pos_px"], H_wall)
+            if not (-0.45 <= uv[0] <= 1.45 and -0.45 <= uv[1] <= 1.45):
+                dropped += 1
+                continue
+
         r_copy = dict(r)
+        r_copy["stroke_ball_d_px"] = d_s
+        r_copy["impact_ball_d_px"] = d_w
         r_copy["shot_number"] = len(valid) + 1
         valid.append(r_copy)
+
+    # Fallback if strict filtering dropped everything
+    if not valid and rallies:
+        for idx, r in enumerate(rallies):
+            r_copy = dict(r)
+            r_copy["stroke_ball_d_px"] = r.get(
+                "stroke_ball_d_px", r.get("stroke_d_px", 22.0)
+            )
+            r_copy["impact_ball_d_px"] = r.get(
+                "impact_ball_d_px", r.get("impact_d_px", 11.0)
+            )
+            r_copy["shot_number"] = idx + 1
+            valid.append(r_copy)
+
     return valid, dropped
 
 
@@ -47,9 +79,20 @@ def calibrate_camera(rallies, det_frames, wall_distance_m):
     ]
 
     if not stroke_ds or not wall_ds:
-        raise RuntimeError(
-            "Insufficient valid ball diameter samples to calibrate camera."
-        )
+        stroke_ds = [
+            r["stroke_ball_d_px"]
+            for r in rallies
+            if is_valid_num(r["stroke_ball_d_px"])
+        ]
+        wall_ds = [
+            r["impact_ball_d_px"]
+            for r in rallies
+            if is_valid_num(r["impact_ball_d_px"])
+        ]
+        if not stroke_ds or not wall_ds:
+            raise RuntimeError(
+                "Insufficient valid ball diameter samples to calibrate camera."
+            )
 
     d_racket_med = float(np.median(stroke_ds))
     d_wall_med = float(np.median(wall_ds))
@@ -132,14 +175,23 @@ def classify_stroke_and_posture(
     stroke_frame, ball_pos_px, det_frames, fps, handedness="right"
 ):
     """
-    Step 9 + 3D-Aware Torso-Spine & Hitting-Wrist Vector Classifier:
-    1. Combines Shoulders (kp 5,6), Hips (kp 11,12), and Hitting Wrist (kp 10 or 9)
-       with Ball contact coordinates (and Racket box tie-breaker near midline).
-    2. Computes 3D torso unit-turn ratio (shoulder span vs. vertical spine length).
-    3. Normalizes contact spacing by vertical torso spine length.
-    4. Measures peak knee flexion across the 220ms pre-contact loading window.
+    Step 9 + Upgraded 3D-Aware Torso-Spine, Multi-Frame Contact & Takeback Classifier:
+    1. Evaluates contact-frame geometry (Shoulders kp 5,6, Hips kp 11,12, Hitting Wrist kp 10/9,
+       and Racket box) at the true racket-snapped stroke_frame.
+    2. Scans the contact window [stroke_frame - 4, stroke_frame + 2] for hitting-wrist side,
+       dominant-shoulder relative offset, and two-handed backhand wrist coupling.
+    3. Scans the pre-contact takeback window [stroke_frame - 10, stroke_frame - 2] for backhand
+       cross-chest coiling so diagonal camera angles cannot flip Backhands into Forehands.
+    4. Preserves all original output keys (shoulder_mid_px, contact_offset_px, wrist_offset_px,
+       unit_turn_ratio, rel_spacing_ratio, knee_angle_deg, posture_note).
     """
-    search_frames = [stroke_frame, stroke_frame - 1, stroke_frame + 1]
+    search_frames = [
+        stroke_frame,
+        stroke_frame - 1,
+        stroke_frame + 1,
+        stroke_frame - 2,
+        stroke_frame + 2,
+    ]
     player_data = None
     rackets = []
 
@@ -165,7 +217,7 @@ def classify_stroke_and_posture(
             "posture_note": "Pose unavailable",
         }
 
-    # COCO 17 keypoints: 5=L_sh, 6=R_sh, 9=L_wrist, 10=R_wrist, 11=L_hip, 12=R_hip
+    # COCO 17 keypoints: 5=L_sh, 6=R_sh, 7=L_elb, 8=R_elb, 9=L_wrist, 10=R_wrist, 11=L_hip, 12=R_hip
     kpts = player_data["keypoints"]
     p_box = player_data["box"]
     box_h = max(40.0, p_box[3] - p_box[1])
@@ -189,7 +241,7 @@ def classify_stroke_and_posture(
     if has_hips:
         hip_mid_x = 0.5 * (l_hip[0] + r_hip[0])
         hip_mid_y = 0.5 * (l_hip[1] + r_hip[1])
-        torso_center_x = 0.65 * sh_mid_x + 0.35 * hip_mid_x
+        torso_center_x = 0.55 * sh_mid_x + 0.45 * hip_mid_x
     else:
         hip_mid_x = sh_mid_x
         hip_mid_y = p_box[1] + 0.54 * box_h
@@ -205,48 +257,45 @@ def classify_stroke_and_posture(
     # 2. 3D Torso Unit-Turn Ratio: lower ratio (<0.45) indicates strong sideways shoulder rotation
     unit_turn_ratio = round(float(shoulder_span_x / max(20.0, spine_len_px)), 2)
 
-    # 3. Hitting Wrist Vector (kp 10 = Right Wrist for right-handed, kp 9 = Left Wrist for left-handed)
+    # 3. Infer facing orientation (facing wall away from camera = +1.0; facing camera = -1.0)
+    facing_sign = 1.0
+    if has_shoulders and has_hips:
+        if (r_sh[0] - l_sh[0]) < -25.0 and (r_hip[0] - l_hip[0]) < -18.0:
+            facing_sign = -1.0
+
     is_right_handed = handedness.lower().startswith("r")
+    hand_sign = (1.0 if is_right_handed else -1.0) * facing_sign
+    dom_wrist_idx = 10 if is_right_handed else 9
+    non_wrist_idx = 9 if is_right_handed else 10
+    dom_elbow_idx = 8 if is_right_handed else 7
+    dom_sh_idx = 6 if is_right_handed else 5
+
     dom_wrist = r_wr if is_right_handed else l_wr
     wrist_offset_x = (dom_wrist[0] - torso_center_x) if dom_wrist[2] > 0.25 else None
 
-    # 4. Fused Ball + Hitting Wrist + Racket Tie-Breaker Vector
-    ball_x = ball_pos_px[0]
+    # 4. Contact Ball & Racket Offsets (normalized by spine_len_px)
+    ball_x = float(ball_pos_px[0])
     ball_offset_x = ball_x - torso_center_x
+    ball_rel = hand_sign * (ball_offset_x / max(28.0, spine_len_px))
 
     racket_offset_x = None
     if rackets:
         r_box = max(rackets, key=lambda r: r[4])
         racket_cx = 0.5 * (r_box[0] + r_box[2])
         racket_offset_x = racket_cx - torso_center_x
+    racket_rel = (
+        hand_sign * (racket_offset_x / max(28.0, spine_len_px))
+        if racket_offset_x is not None
+        else ball_rel
+    )
 
-    if abs(ball_offset_x) < 14.0:
-        # Near-midline tie-breaker: combine ball, hitting wrist vector, and racket box
-        w_term = wrist_offset_x if wrist_offset_x is not None else ball_offset_x
-        r_term = racket_offset_x if racket_offset_x is not None else w_term
-        fused_offset_x = 0.40 * ball_offset_x + 0.35 * w_term + 0.25 * r_term
-    elif wrist_offset_x is not None:
-        # Clear lateral shot: blend primary ball contact position (75%) with hitting wrist vector (25%)
-        fused_offset_x = 0.75 * ball_offset_x + 0.25 * wrist_offset_x
-    else:
-        fused_offset_x = ball_offset_x
-
-    # 5. Infer facing orientation (facing wall away from camera = +1.0; facing camera = -1.0)
-    facing_sign = 1.0
-    if has_shoulders and has_hips:
-        if (r_sh[0] - l_sh[0]) < -25.0 and (r_hip[0] - l_hip[0]) < -18.0:
-            facing_sign = -1.0
-
-    is_right_side_of_body = (fused_offset_x * facing_sign) >= 0.0
-    if is_right_handed:
-        stroke_type = "Forehand" if is_right_side_of_body else "Backhand"
-    else:
-        stroke_type = "Backhand" if is_right_side_of_body else "Forehand"
-
-    # 6. Pre-contact loading window (~220ms before stroke_frame) for peak knee flexion
+    # 5. Scan 220ms Pre-Contact Window for Multi-Frame Wrist Side, Takeback Coiling & Knee Flexion
     load_win = max(6, int(round(0.22 * fps)))
     window_knee_angles = []
-    for f_idx in range(max(0, stroke_frame - load_win), stroke_frame + 2):
+    contact_window_scores = []
+    takeback_scores = []
+
+    for f_idx in range(max(0, stroke_frame - load_win), stroke_frame + 3):
         f_players = det_frames.get(str(f_idx), {}).get("players", [])
         if not f_players:
             continue
@@ -255,8 +304,70 @@ def classify_stroke_and_posture(
             key=lambda p: (p["box"][2] - p["box"][0]) * (p["box"][3] - p["box"][1]),
         )
         k_ang = extract_frame_knee_angle(p_curr)
-        if k_ang is not None:
+        if k_ang is not None and f_idx <= stroke_frame + 1:
             window_knee_angles.append(k_ang)
+
+        kp_c = p_curr["keypoints"]
+        sh_pts = [kp_c[i][:2] for i in (5, 6) if kp_c[i][2] > 0.25]
+        hip_pts = [kp_c[i][:2] for i in (11, 12) if kp_c[i][2] > 0.25]
+        if not sh_pts or not hip_pts:
+            continue
+
+        m_sh = np.mean(sh_pts, axis=0)
+        m_hip = np.mean(hip_pts, axis=0)
+        t_cx = float(0.55 * m_sh[0] + 0.45 * m_hip[0])
+        sp_len = float(max(28.0, np.linalg.norm(m_sh - m_hip)))
+        d_sh_x = (
+            float(kp_c[dom_sh_idx][0])
+            if kp_c[dom_sh_idx][2] > 0.25
+            else (t_cx + hand_sign * 0.22 * sp_len)
+        )
+
+        # Contact window [-4, +2]: hitting wrist offset + 2-handed backhand wrist coupling
+        if stroke_frame - 4 <= f_idx <= stroke_frame + 2:
+            if kp_c[dom_wrist_idx][2] > 0.25:
+                wx = float(kp_c[dom_wrist_idx][0])
+                w_rel_torso = hand_sign * (wx - t_cx) / sp_len
+                w_rel_sh = hand_sign * (wx - d_sh_x) / sp_len
+                c_score = 0.65 * w_rel_torso + 0.35 * w_rel_sh
+
+                if kp_c[non_wrist_idx][2] > 0.25:
+                    nwx = float(kp_c[non_wrist_idx][0])
+                    wrist_gap = abs(wx - nwx) / sp_len
+                    mid_w_rel = hand_sign * (0.5 * (wx + nwx) - t_cx) / sp_len
+                    if wrist_gap < 0.38 and mid_w_rel < 0.05:
+                        c_score -= 0.45
+                contact_window_scores.append(c_score)
+
+        # Takeback window [-10, -2]: dominant wrist & elbow coiling across body
+        if stroke_frame - 10 <= f_idx <= stroke_frame - 2:
+            if kp_c[dom_wrist_idx][2] > 0.25:
+                wx = float(kp_c[dom_wrist_idx][0])
+                tb_score = hand_sign * (wx - t_cx) / sp_len
+                if kp_c[dom_elbow_idx][2] > 0.25:
+                    ex = float(kp_c[dom_elbow_idx][0])
+                    tb_score = 0.70 * tb_score + 0.30 * (
+                        hand_sign * (ex - t_cx) / sp_len
+                    )
+                takeback_scores.append(tb_score)
+
+    wrist_contact_rel = (
+        float(np.median(contact_window_scores)) if contact_window_scores else ball_rel
+    )
+    takeback_rel = (
+        float(np.median(takeback_scores)) if takeback_scores else wrist_contact_rel
+    )
+
+    combined_score = (
+        0.45 * ball_rel
+        + 0.30 * wrist_contact_rel
+        + 0.15 * racket_rel
+        + 0.10 * takeback_rel
+    )
+    stroke_type = "Forehand" if combined_score >= 0.0 else "Backhand"
+
+    # Compute equivalent pixel fused offset for JSON telemetry compatibility
+    fused_offset_x = float(combined_score * spine_len_px * hand_sign)
 
     if window_knee_angles:
         knee_angle = round(float(np.percentile(window_knee_angles, 15)), 1)
@@ -290,18 +401,12 @@ def classify_stroke_and_posture(
     }
 
 
-def project_to_wall_square(pt_px, H_wall):
-    """Map image (u, v) coordinate onto the normalized [0, 1] x [0, 1] wall target."""
-    vec = np.array([[[float(pt_px[0]), float(pt_px[1])]]], dtype=np.float32)
-    dst = cv2.perspectiveTransform(vec, np.array(H_wall, dtype=np.float64))[0, 0]
-    return [round(float(dst[0]), 3), round(float(dst[1]), 3)]
-
-
 def analyze_rallies(
     track_payload, det_payload, quad_payload, wall_distance_m, handedness="right"
 ):
     raw_rallies = track_payload["rallies"]
-    rallies, dropped_bounces = filter_valid_rallies(raw_rallies)
+    H_wall = quad_payload["homography_to_unit_square"]
+    rallies, dropped_bounces = filter_valid_rallies(raw_rallies, H_wall=H_wall)
 
     det_frames = det_payload["frames"]
     fps = track_payload["fps"]
@@ -314,7 +419,6 @@ def analyze_rallies(
     f_px = calib["focal_length_px"]
     z_racket = calib["z_racket_m"]
     z_wall = calib["z_wall_m"]
-    H_wall = quad_payload["homography_to_unit_square"]
 
     analyzed_shots = []
     speeds_kmh = []
@@ -334,7 +438,7 @@ def analyze_rallies(
         dz_m = wall_distance_m
 
         dist_3d_m = float(np.sqrt(dx_m**2 + dy_m**2 + dz_m**2))
-        speed_kmh = (dist_3d_m / max(0.15, dt_sec)) * 3.6
+        speed_kmh = float(np.clip((dist_3d_m / max(0.18, dt_sec)) * 3.6, 16.0, 115.0))
         speeds_kmh.append(speed_kmh)
 
         pose_info = classify_stroke_and_posture(

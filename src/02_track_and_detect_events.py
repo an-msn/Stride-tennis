@@ -1,317 +1,313 @@
 import os
 import json
-import warnings
+import math
 import argparse
 from collections import defaultdict
 import numpy as np
 import cv2
+import librosa
+from scipy.signal import savgol_filter, find_peaks
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.signal import correlate, find_peaks, savgol_filter
 
 
-def suppress_static_balls(frames_dict, fps, grid_px=8.0, min_duration_sec=0.8):
+# Module-level reference populated by suppress_static_balls so analyze_proximity_and_events
+# can access player pose & racket detections without changing run_pipeline.py's call signature.
+_CACHED_DET_FRAMES = {}
+
+
+def suppress_static_balls(frames_dict, fps, bucket_px=8.0, min_static_sec=0.8):
     """
-    Rule 1 (Step 5): Any position holding a ball detection for ~1 second or more
-    is static scenery (e.g., pale mark on the wall). Drop it before tracking.
-    Also rejects non-ball giant boxes (>45px minor axis) and tiny noise (<4px).
+    Pre-tracking static ball & player-shoe false-positive filter:
+    1. Rejects oversize boxes (min(w,h) > 45px) and tiny noise (< 4px).
+    2. Masks out low-confidence false positives sitting directly on the player's shoes/ankles.
+    3. Drops static background marks appearing in the same spatial bucket across >= 0.8s.
     """
-    bucket_frames = defaultdict(set)
-    total_frames = len(frames_dict)
+    global _CACHED_DET_FRAMES
+    _CACHED_DET_FRAMES = frames_dict
+
+    bucket_Frames = defaultdict(set)
+    parsed_frames = {}
 
     for f_str, f_data in frames_dict.items():
         f_idx = int(f_str)
-        for b in f_data["balls"]:
-            if (
-                min(b[2] - b[0], b[3] - b[1]) > 45.0
-                or max(b[2] - b[0], b[3] - b[1]) > 65.0
-            ):
+        balls = f_data.get("balls", [])
+        players = f_data.get("players", [])
+
+        # Collect ankle/foot coordinates (kp 15, 16) to suppress white-shoe false positives
+        foot_pts = []
+        for p in players:
+            kpts = p.get("keypoints", [])
+            for ankle_idx in (15, 16):
+                if ankle_idx < len(kpts) and kpts[ankle_idx][2] > 0.25:
+                    foot_pts.append(
+                        (float(kpts[ankle_idx][0]), float(kpts[ankle_idx][1]))
+                    )
+
+        valid_balls = []
+        for b in balls:
+            x1, y1, x2, y2, conf = b
+            w = x2 - x1
+            h = y2 - y1
+            if w < 4.0 or h < 4.0:
+                continue
+            if min(w, h) > 45.0 or max(w, h) > 68.0:
+                continue
+            aspect = max(w, h) / max(1.0, min(w, h))
+            if aspect > 4.2:
                 continue
 
-            cx = 0.5 * (b[0] + b[2])
-            cy = 0.5 * (b[1] + b[3])
-            bx, by = int(round(cx / grid_px)), int(round(cy / grid_px))
-            bucket_frames[(bx, by)].add(f_idx)
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
 
-    # Identify static buckets (including immediate 3x3 neighbor buckets)
-    min_frames = max(4, int(round(min_duration_sec * fps)))
-    static_buckets = set()
-    for (bx, by), f_set in bucket_frames.items():
-        combined = set(f_set)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                combined |= bucket_frames.get((bx + dx, by + dy), set())
-        if len(combined) >= min_frames:
-            span = max(combined) - min(combined) + 1
-            if len(combined) >= 0.25 * total_frames or (
-                span >= min_frames and len(combined) / max(1, span) > 0.35
-            ):
-                static_buckets.add((bx, by))
+            # Reject low/medium-confidence detections sitting right on the player's white shoes
+            on_shoe = False
+            for fx, fy in foot_pts:
+                if math.hypot(cx - fx, cy - fy) < 38.0 and conf < 0.62:
+                    on_shoe = True
+                    break
+            if on_shoe:
+                continue
+
+            bx = int(round(cx / bucket_px))
+            by = int(round(cy / bucket_px))
+            bucket_Frames[(bx, by)].add(f_idx)
+            valid_balls.append([x1, y1, x2, y2, conf, bx, by])
+        parsed_frames[f_idx] = valid_balls
+
+    min_frames_thresh = max(5, int(round(min_static_sec * fps)))
+    static_buckets = {
+        k for k, f_set in bucket_Frames.items() if len(f_set) >= min_frames_thresh
+    }
 
     cleaned_balls = {}
     removed_count = 0
     kept_count = 0
 
-    for f_str, f_data in frames_dict.items():
-        f_idx = int(f_str)
-        valid = []
-        for b in f_data["balls"]:
-            w, h = b[2] - b[0], b[3] - b[1]
-            if min(w, h) > 45.0 or max(w, h) > 65.0 or max(w, h) < 4.0:
-                removed_count += 1
-                continue
-            cx = 0.5 * (b[0] + b[2])
-            cy = 0.5 * (b[1] + b[3])
-            bx, by = int(round(cx / grid_px)), int(round(cy / grid_px))
-            if (bx, by) in static_buckets:
+    for f_idx, b_list in parsed_frames.items():
+        clean_list = []
+        for b in b_list:
+            x1, y1, x2, y2, conf, bx, by = b
+            is_static = any(
+                (bx + dx, by + dy) in static_buckets
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+            )
+            if is_static:
                 removed_count += 1
             else:
-                valid.append(b)
+                clean_list.append([x1, y1, x2, y2, conf])
                 kept_count += 1
-        cleaned_balls[f_idx] = valid
+        cleaned_balls[f_idx] = clean_list
 
     return cleaned_balls, removed_count, kept_count
 
 
 class AsymmetricBallKalmanTracker:
     """
-    Step 5: Constant-velocity Kalman filter with downward gravity bias,
-    nearest-to-prediction association, asymmetric confidence thresholds,
-    and frame-bounds respect.
+    4-Rule Asymmetric Kalman Filter with Downward Gravity Bias & Tight Spatial Gating:
+    State vector: [cx, cy, vx, vy]^T
     """
 
-    def __init__(self, width, height, fps, conf_init=0.50, conf_keep=0.12, max_coast=8):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.conf_init = conf_init
-        self.conf_keep = conf_keep
-        self.max_coast = max_coast
-        self.max_gate_dist = max(90.0, 1100.0 / max(24.0, fps))
-        self.gravity_px = 450.0 / (fps**2)
-        self.reset()
+    def __init__(self, width, height, fps):
+        self.width = float(width)
+        self.height = float(height)
+        self.fps = float(fps)
+        self.dt = 1.0 / max(1.0, self.fps)
+        self.gravity_px_per_frame2 = 980.0 * (self.dt**2)
 
-    def reset(self):
         self.active = False
-        self.coast_count = 0
-        self.x = np.zeros((4, 1), dtype=np.float64)  # [cx, cy, vx, vy]
-        self.P = np.eye(4, dtype=np.float64) * 500.0
+        self.coasted_frames = 0
+        self.max_coast = max(6, int(round(0.20 * self.fps)))
+        self.high_conf_init = 0.45
+        self.low_conf_cont = 0.12
+
+        self.x = np.zeros((4, 1), dtype=np.float64)
+        self.P = np.eye(4, dtype=np.float64) * 100.0
         self.last_d = np.nan
 
-    def predict(self):
-        F = np.array(
-            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 0.98, 0], [0, 0, 0, 0.98]],
+        self.F = np.array(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 0.985, 0.0],
+                [0.0, 0.0, 0.0, 0.985],
+            ],
             dtype=np.float64,
         )
-        Q = np.diag([4.0, 4.0, 25.0, 25.0])
-        self.x = F @ self.x
-        self.x[1, 0] += 0.5 * self.gravity_px
-        self.x[3, 0] += self.gravity_px
-        self.P = F @ self.P @ F.T + Q
-        return float(self.x[0, 0]), float(self.x[1, 0])
-
-    def update(self, cx, cy):
-        H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float64)
-        R = np.diag([9.0, 9.0])
-        z = np.array([[cx], [cy]], dtype=np.float64)
-        y = z - (H @ self.x)
-        S = H @ self.P @ H.T + R
-        K = self.P @ H.T @ np.linalg.inv(S)
-        self.x = self.x + (K @ y)
-        self.P = (np.eye(4) - K @ H) @ self.P
-        self.coast_count = 0
+        self.H = np.array(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float64
+        )
+        self.R = np.diag([9.0, 9.0])
+        self.Q = np.diag([4.0, 4.0, 22.0, 22.0])
 
     @staticmethod
-    def compute_blur_compensated_diameter(w, h, vx, vy):
-        """
-        Upgrade: Motion blur stretches the bounding box along velocity (vx, vy).
-        The dimension perpendicular to motion (minor axis) reflects true ball diameter.
-        """
-        speed = np.hypot(vx, vy)
+    def compute_blur_compensated_diameter(x1, y1, x2, y2, vx, vy):
+        w = max(1.0, float(x2 - x1))
+        h = max(1.0, float(y2 - y1))
+        speed = math.hypot(vx, vy)
         if speed > 8.0:
             return float(min(w, h))
-        return float(np.sqrt(w * h))
+        return float(math.sqrt(w * h))
+
+    def _reset(self):
+        self.active = False
+        self.coasted_frames = 0
+        self.last_d = np.nan
 
     def step(self, candidates):
         if not self.active:
-            strong = [c for c in candidates if c[4] >= self.conf_init]
-            if not strong:
+            high_cands = [
+                c
+                for c in candidates
+                if c[4] >= self.high_conf_init
+                and (0.5 * (c[0] + c[2])) < self.width * 0.85
+            ]
+            if not high_cands:
                 return {
                     "tracked": False,
                     "coasted": False,
                     "cx": np.nan,
                     "cy": np.nan,
+                    "vx": 0.0,
+                    "vy": 0.0,
                     "d": np.nan,
-                    "conf": np.nan,
+                    "conf": 0.0,
                 }
-            best = max(strong, key=lambda c: c[4])
-            cx, cy = 0.5 * (best[0] + best[2]), 0.5 * (best[1] + best[3])
-            w, h = best[2] - best[0], best[3] - best[1]
-            self.active = True
-            self.coast_count = 0
+            best = max(high_cands, key=lambda c: c[4])
+            cx = 0.5 * (best[0] + best[2])
+            cy = 0.5 * (best[1] + best[3])
             self.x = np.array([[cx], [cy], [0.0], [0.0]], dtype=np.float64)
-            self.P = np.diag([16.0, 16.0, 200.0, 200.0])
-            self.last_d = float(np.sqrt(w * h))
+            self.P = np.diag([16.0, 16.0, 150.0, 150.0])
+            self.active = True
+            self.coasted_frames = 0
+            self.last_d = self.compute_blur_compensated_diameter(
+                best[0], best[1], best[2], best[3], 0.0, 0.0
+            )
             return {
                 "tracked": True,
                 "coasted": False,
-                "cx": cx,
-                "cy": cy,
-                "d": self.last_d,
-                "conf": best[4],
+                "cx": round(float(cx), 2),
+                "cy": round(float(cy), 2),
+                "vx": 0.0,
+                "vy": 0.0,
+                "d": round(float(self.last_d), 2),
+                "conf": round(float(best[4]), 4),
             }
 
-        pred_x, pred_y = self.predict()
+        # Predict next state with downward gravity bias
+        self.x = self.F @ self.x
+        self.x[3, 0] += self.gravity_px_per_frame2
+        self.P = self.F @ self.P @ self.F.T + self.Q
 
-        if not (0 <= pred_x < self.width and 0 <= pred_y < self.height):
-            self.reset()
+        pred_x = float(self.x[0, 0])
+        pred_y = float(self.x[1, 0])
+
+        # Tighter spatial gate prevents jumping to stray court/background glints
+        max_gate_px = 110.0 + 24.0 * self.coasted_frames
+        valid_cands = []
+        for c in candidates:
+            if c[4] < self.low_conf_cont:
+                continue
+            cx = 0.5 * (c[0] + c[2])
+            cy = 0.5 * (c[1] + c[3])
+            dist = math.hypot(cx - pred_x, cy - pred_y)
+            # Require high confidence if a candidate is near the outer half of the gate
+            if dist <= max_gate_px and (dist <= 65.0 or c[4] >= 0.35):
+                valid_cands.append((dist, cx, cy, c))
+
+        if valid_cands:
+            valid_cands.sort(key=lambda item: item[0])
+            _, meas_x, meas_y, best_c = valid_cands[0]
+            z = np.array([[meas_x], [meas_y]], dtype=np.float64)
+            y_res = z - (self.H @ self.x)
+            S = self.H @ self.P @ self.H.T + self.R
+            K = self.P @ self.H.T @ np.linalg.inv(S)
+            self.x = self.x + (K @ y_res)
+            self.P = (np.eye(4) - K @ self.H) @ self.P
+
+            self.coasted_frames = 0
+            vx = float(self.x[2, 0])
+            vy = float(self.x[3, 0])
+            self.last_d = self.compute_blur_compensated_diameter(
+                best_c[0], best_c[1], best_c[2], best_c[3], vx, vy
+            )
+            return {
+                "tracked": True,
+                "coasted": False,
+                "cx": round(float(self.x[0, 0]), 2),
+                "cy": round(float(self.x[1, 0]), 2),
+                "vx": round(vx, 2),
+                "vy": round(vy, 2),
+                "d": round(float(self.last_d), 2),
+                "conf": round(float(best_c[4]), 4),
+            }
+
+        # Coast on gravity prediction when ball is occluded or motion-blurred
+        self.coasted_frames += 1
+        out_of_bounds = (
+            pred_x < 0.0 or pred_x > self.width or pred_y < 0.0 or pred_y > self.height
+        )
+        if self.coasted_frames > self.max_coast or out_of_bounds:
+            self._reset()
             return {
                 "tracked": False,
                 "coasted": False,
                 "cx": np.nan,
                 "cy": np.nan,
+                "vx": 0.0,
+                "vy": 0.0,
                 "d": np.nan,
-                "conf": np.nan,
-            }
-
-        valid_cands = [c for c in candidates if c[4] >= self.conf_keep]
-        best_cand = None
-        best_dist = float("inf")
-        gate = self.max_gate_dist * (1.0 + 0.25 * self.coast_count)
-
-        for c in valid_cands:
-            cx, cy = 0.5 * (c[0] + c[2]), 0.5 * (c[1] + c[3])
-            dist = np.hypot(cx - pred_x, cy - pred_y)
-            if dist < best_dist and dist <= gate:
-                best_dist = dist
-                best_cand = c
-
-        if best_cand is not None:
-            cx, cy = (
-                0.5 * (best_cand[0] + best_cand[2]),
-                0.5 * (best_cand[1] + best_cand[3]),
-            )
-            w, h = best_cand[2] - best_cand[0], best_cand[3] - best_cand[1]
-            self.update(cx, cy)
-            vx, vy = float(self.x[2, 0]), float(self.x[3, 0])
-            d = self.compute_blur_compensated_diameter(w, h, vx, vy)
-            self.last_d = d
-            return {
-                "tracked": True,
-                "coasted": False,
-                "cx": float(self.x[0, 0]),
-                "cy": float(self.x[1, 0]),
-                "vx": vx,
-                "vy": vy,
-                "d": d,
-                "raw_w": w,
-                "raw_h": h,
-                "conf": best_cand[4],
-            }
-        else:
-            self.coast_count += 1
-            if self.coast_count > self.max_coast:
-                self.reset()
-                return {
-                    "tracked": False,
-                    "coasted": False,
-                    "cx": np.nan,
-                    "cy": np.nan,
-                    "d": np.nan,
-                    "conf": np.nan,
-                }
-            return {
-                "tracked": True,
-                "coasted": True,
-                "cx": pred_x,
-                "cy": pred_y,
-                "vx": float(self.x[2, 0]),
-                "vy": float(self.x[3, 0]),
-                "d": self.last_d,
                 "conf": 0.0,
             }
 
-
-def parabolic_subframe(signal, idx):
-    """
-    Step 6: Fit a parabola through the 3 samples around a turning point
-    to locate the slope's zero crossing to a fraction of a frame.
-    """
-    if idx <= 0 or idx >= len(signal) - 1:
-        return float(idx)
-    s_m1, s_0, s_p1 = float(signal[idx - 1]), float(signal[idx]), float(signal[idx + 1])
-    denom = 2.0 * (s_m1 - 2.0 * s_0 + s_p1)
-    if abs(denom) < 1e-6:
-        return float(idx)
-    delta = (s_m1 - s_p1) / denom
-    return float(idx) + float(np.clip(delta, -0.5, 0.5))
-
-
-def interpolate_at_subframe(series, t_star):
-    idx0 = int(np.clip(np.floor(t_star), 0, len(series) - 1))
-    idx1 = min(len(series) - 1, idx0 + 1)
-    alpha = float(np.clip(t_star - idx0, 0.0, 1.0))
-    v0, v1 = series[idx0], series[idx1]
-    if np.isnan(v0):
-        return float(v1)
-    if np.isnan(v1):
-        return float(v0)
-    return float((1.0 - alpha) * v0 + alpha * v1)
-
-
-def extract_audio_onsets(video_path, fps):
-    """
-    Active Audio-Visual Fusion Upgrade:
-    Extract high-resolution acoustic onset transients (hop_length=256 -> ~11.6ms)
-    from the video's audio track to snap visual contact timestamps.
-    """
-    try:
-        import librosa
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            y_aud, sr = librosa.load(video_path, sr=22050, mono=True)
-            if len(y_aud) == 0:
-                return np.array([])
-            onset_times = librosa.onset.onset_detect(
-                y=y_aud, sr=sr, hop_length=256, units="time", backtrack=False
-            )
-        return onset_times * fps
-    except Exception:
-        return np.array([])
-
-
-def fuse_visual_and_audio_time(
-    t_vis_frame, audio_onsets_frames, max_window_frames=2.5, audio_weight=0.55
-):
-    """
-    If a crisp acoustic transient (racket strike or wall impact) occurs within
-    +-max_window_frames of the visual parabolic turning point, fuse the two
-    timestamps to sharpen sub-frame contact timing.
-    """
-    if len(audio_onsets_frames) == 0:
-        return t_vis_frame, False
-    diffs = np.abs(audio_onsets_frames - t_vis_frame)
-    min_idx = int(np.argmin(diffs))
-    if diffs[min_idx] <= max_window_frames:
-        t_aud = float(audio_onsets_frames[min_idx])
-        t_fused = audio_weight * t_aud + (1.0 - audio_weight) * t_vis_frame
-        return float(t_fused), True
-    return t_vis_frame, False
+        return {
+            "tracked": True,
+            "coasted": True,
+            "cx": round(pred_x, 2),
+            "cy": round(pred_y, 2),
+            "vx": round(float(self.x[2, 0]), 2),
+            "vy": round(float(self.x[3, 0]), 2),
+            "d": round(float(self.last_d), 2),
+            "conf": 0.0,
+        }
 
 
 def smooth_ball_trajectory(track_list, max_interp_gap=4):
     """
-    Zero-phase Savitzky-Golay trajectory smoother:
-    1. Bridges tiny 1-4 frame coasting dropouts linearly.
-    2. Smooths (cx, cy, d) across continuous tracked segments so the AR comet
-       trail and proximity signal are free of single-frame bounding-box jitter.
+    Outlier despiker + Zero-phase Savitzky-Golay trajectory smoother:
+    1. Removes isolated 1-3 frame teleport spikes (e.g., stray court glints or shoe snaps).
+    2. Bridges tiny 1-4 frame coasting dropouts linearly.
+    3. Smooths (cx, cy, d) across continuous tracked segments.
     """
     N = len(track_list)
     cx = np.array([t["cx"] for t in track_list], dtype=np.float64)
     cy = np.array([t["cy"] for t in track_list], dtype=np.float64)
     d = np.array([t["d"] for t in track_list], dtype=np.float64)
 
-    # Bridge tiny gaps (<= max_interp_gap frames) between valid detections
+    # 1. Despike isolated 1-2 frame spatial jumps (> 115px away from neighbors)
+    for k in range(2, N - 2):
+        if np.isnan(cx[k]) or np.isnan(cy[k]):
+            continue
+        prev_idx = k - 1 if not np.isnan(cx[k - 1]) else k - 2
+        next_idx = k + 1 if not np.isnan(cx[k + 1]) else k + 2
+        if not np.isnan(cx[prev_idx]) and not np.isnan(cx[next_idx]):
+            mid_x = 0.5 * (cx[prev_idx] + cx[next_idx])
+            mid_y = 0.5 * (cy[prev_idx] + cy[next_idx])
+            neighbor_span = math.hypot(
+                cx[next_idx] - cx[prev_idx], cy[next_idx] - cy[prev_idx]
+            )
+            dev = math.hypot(cx[k] - mid_x, cy[k] - mid_y)
+            if dev > 95.0 and dev > 1.8 * neighbor_span:
+                cx[k] = np.nan
+                cy[k] = np.nan
+                d[k] = np.nan
+                track_list[k]["tracked"] = False
+                track_list[k]["coasted"] = False
+
+    # 2. Bridge tiny gaps (<= max_interp_gap frames) between valid detections
     valid = ~np.isnan(cx) & ~np.isnan(cy)
     if np.sum(valid) < 10:
         return track_list
@@ -321,15 +317,17 @@ def smooth_ball_trajectory(track_list, max_interp_gap=4):
         s, e = valid_idx[i], valid_idx[i + 1]
         gap = e - s - 1
         if 0 < gap <= max_interp_gap:
-            for k in range(s + 1, e):
-                alpha = (k - s) / float(e - s)
-                cx[k] = (1.0 - alpha) * cx[s] + alpha * cx[e]
-                cy[k] = (1.0 - alpha) * cy[s] + alpha * cy[e]
-                d[k] = (1.0 - alpha) * d[s] + alpha * d[e]
-                track_list[k]["tracked"] = True
-                track_list[k]["coasted"] = True
+            dist_gap = math.hypot(cx[e] - cx[s], cy[e] - cy[s])
+            if dist_gap <= 65.0 * (gap + 1):
+                for k in range(s + 1, e):
+                    alpha = (k - s) / float(e - s)
+                    cx[k] = (1.0 - alpha) * cx[s] + alpha * cx[e]
+                    cy[k] = (1.0 - alpha) * cy[s] + alpha * cy[e]
+                    d[k] = (1.0 - alpha) * d[s] + alpha * d[e]
+                    track_list[k]["tracked"] = True
+                    track_list[k]["coasted"] = True
 
-    # Apply Savitzky-Golay filter (window=7, polyorder=2) over contiguous tracked runs
+    # 3. Apply Savitzky-Golay filter (window=7, polyorder=2) over contiguous tracked runs
     is_trk = ~np.isnan(cx) & ~np.isnan(cy)
     run_start = None
     for i in range(N + 1):
@@ -362,224 +360,471 @@ def smooth_ball_trajectory(track_list, max_interp_gap=4):
     return track_list
 
 
-def analyze_proximity_and_events(track_list, wall_corners, fps, video_path=None):
+def parabolic_subframe(signal_arr, idx):
+    """3-point parabolic sub-frame peak/trough refinement."""
+    if idx <= 0 or idx >= len(signal_arr) - 1:
+        return float(idx)
+    y0 = float(signal_arr[idx - 1])
+    y1 = float(signal_arr[idx])
+    y2 = float(signal_arr[idx + 1])
+    denom = 2.0 * (y0 - 2.0 * y1 + y2)
+    if abs(denom) < 1e-6:
+        return float(idx)
+    delta = (y0 - y2) / denom
+    return float(idx + np.clip(delta, -0.5, 0.5))
+
+
+def extract_audio_onsets(video_path, sr=22050, hop_length=256):
+    """Extract acoustic onset timestamps (seconds) if the video contains an audio stream."""
+    if video_path is None or not os.path.exists(video_path):
+        return np.array([], dtype=np.float64)
+    try:
+        y, sr_loaded = librosa.load(video_path, sr=sr, mono=True)
+        if y is None or len(y) == 0 or np.max(np.abs(y)) < 1e-4:
+            return np.array([], dtype=np.float64)
+        onset_frames = librosa.onset.onset_detect(
+            y=y, sr=sr_loaded, hop_length=hop_length, backtrack=False, units="frames"
+        )
+        return librosa.frames_to_time(onset_frames, sr=sr_loaded, hop_length=hop_length)
+    except Exception:
+        return np.array([], dtype=np.float64)
+
+
+def fuse_visual_and_audio_time(
+    vis_frame_float, fps, audio_onsets_sec, max_tol_frames=2.5
+):
+    """Snap visual sub-frame timestamp toward acoustic transient if within +-2.5 frames."""
+    vis_sec = vis_frame_float / float(fps)
+    if audio_onsets_sec is None or len(audio_onsets_sec) == 0:
+        return vis_sec, False
+    diffs = np.abs(audio_onsets_sec - vis_sec)
+    min_i = int(np.argmin(diffs))
+    if diffs[min_i] <= (max_tol_frames / float(fps)):
+        aud_sec = float(audio_onsets_sec[min_i])
+        fused_sec = 0.55 * aud_sec + 0.45 * vis_sec
+        return fused_sec, True
+    return vis_sec, False
+
+
+def _get_player_wrist_and_racket_info(det_frames, f_idx):
+    """Return primary player's wrists, shoulders, hips, box, and detected racket center at f_idx."""
+    if not det_frames:
+        return None
+    f_data = det_frames.get(str(f_idx), {})
+    players = f_data.get("players", [])
+    if not players:
+        return None
+    primary = max(
+        players, key=lambda p: (p["box"][2] - p["box"][0]) * (p["box"][3] - p["box"][1])
+    )
+    kpts = primary["keypoints"]
+    wrists = []
+    for w_i in (9, 10):
+        if w_i < len(kpts) and kpts[w_i][2] > 0.20:
+            wrists.append((float(kpts[w_i][0]), float(kpts[w_i][1])))
+
+    sh_y = [float(kpts[i][1]) for i in (5, 6) if i < len(kpts) and kpts[i][2] > 0.20]
+    hip_y = [float(kpts[i][1]) for i in (11, 12) if i < len(kpts) and kpts[i][2] > 0.20]
+    sh_x = [float(kpts[i][0]) for i in (5, 6) if i < len(kpts) and kpts[i][2] > 0.20]
+    hip_x = [float(kpts[i][0]) for i in (11, 12) if i < len(kpts) and kpts[i][2] > 0.20]
+
+    torso_cx = (
+        float(np.mean(sh_x + hip_x))
+        if (sh_x or hip_x)
+        else 0.5 * (primary["box"][0] + primary["box"][2])
+    )
+    top_sh_y = float(min(sh_y)) if sh_y else float(primary["box"][1])
+    bot_hip_y = (
+        float(max(hip_y))
+        if hip_y
+        else float(0.5 * (primary["box"][1] + primary["box"][3]))
+    )
+    spine_len = max(32.0, bot_hip_y - top_sh_y)
+
+    rackets = f_data.get("rackets", [])
+    racket_centers = [
+        (0.5 * (r[0] + r[2]), 0.5 * (r[1] + r[3])) for r in rackets if r[4] >= 0.20
+    ]
+
+    return {
+        "box": primary["box"],
+        "wrists": wrists,
+        "rackets": racket_centers,
+        "torso_cx": torso_cx,
+        "top_sh_y": top_sh_y,
+        "bot_hip_y": bot_hip_y,
+        "spine_len": spine_len,
+    }
+
+
+def snap_bounce_to_racket_contact(
+    cand_peak_idx, search_end_idx, cx, cy, prox_s, det_frames, wall_corners_px, fps
+):
     """
-    Step 6 + Active Audio-Visual Fusion:
-    Build 1D proximity signal from z-scores of ball vertical position (cy)
-    and apparent size (d), find rally period via autocorrelation, detect
-    validated stroke maxima & wall impact minima, and fuse with audio transients.
+    Fixes the Ground-Bounce vs. Racket-Contact timing bug & rejects phantom mid-air peaks:
+    In wall practice, the ball hits the court floor (max cy / proximity peak) ~0.25-0.45s
+    BEFORE rising to waist height where the player's racket strikes it.
+    This function scans forward from the ground bounce to find the exact frame where:
+      1. The ball comes closest to the player's wrists (kp 9, 10) or tennis-racket box.
+      2. The ball immediately accelerates upward (dy < 0) toward the wall.
+      3. Rejects the candidate completely if the ball is never within physical reach of the player
+         (e.g., Shot #06 fence bounce or Shot #14 mid-air flight spike).
     """
+    N = len(cx)
+    wall_arr = np.array(wall_corners_px, dtype=np.float64)
+    wall_top_y = float(np.min(wall_arr[:, 1]))
+
+    # Search from 3 frames before the proximity peak up to 0.45s after (representing post-bounce rise to racket)
+    w_start = max(2, cand_peak_idx - 3)
+    w_end = min(N - 5, search_end_idx, cand_peak_idx + int(round(0.45 * fps)))
+    if w_end <= w_start:
+        w_end = min(N - 5, w_start + 4)
+
+    best_f = None
+    best_score = -1e9
+    best_min_dist = 1e9
+
+    for f in range(w_start, w_end + 1):
+        bx, by = float(cx[f]), float(cy[f])
+        # Outbound upward launch velocity over the next 4 frames (negative dy = flying up toward wall)
+        f_ahead = min(N - 1, f + 4)
+        upward_launch = (by - float(cy[f_ahead])) / max(
+            1, f_ahead - f
+        )  # positive when moving UP
+
+        p_info = _get_player_wrist_and_racket_info(det_frames, f)
+        if p_info is None:
+            continue
+
+        # Measure shortest distance from ball to hitting wrists or racket head
+        strike_targets = list(p_info["wrists"]) + list(p_info["rackets"])
+        if strike_targets:
+            min_dist = min(math.hypot(bx - tx, by - ty) for tx, ty in strike_targets)
+        else:
+            min_dist = math.hypot(bx - p_info["torso_cx"], by - p_info["bot_hip_y"])
+
+        spine = p_info["spine_len"]
+        norm_dist = min_dist / spine
+
+        # Ball at racket impact should be near waist/chest height (not high above the wall/fence)
+        if by < wall_top_y + 25.0:
+            continue
+
+        # Score combines closeness to wrist/racket + immediate upward launch toward the wall
+        # Ground bounces have large norm_dist (> 1.6x spine) and slower initial upward speed;
+        # True racket contact has small norm_dist (0.15x - 1.15x spine) and fast upward launch.
+        launch_bonus = 0.08 * np.clip(upward_launch, -10.0, 35.0)
+        prox_bonus = 0.15 * float(prox_s[f])
+        score = -1.65 * norm_dist + launch_bonus + prox_bonus
+
+        # Extra bonus if the ball is actively transitioning into rapid upward flight right after contact
+        if upward_launch > 3.5 and norm_dist < 1.35:
+            score += 0.85
+
+        if score > best_score:
+            best_score = score
+            best_f = f
+            best_min_dist = norm_dist
+
+    if best_f is None:
+        return None
+
+    # Physical Reach Gate: Reject phantom mid-air peaks where the ball never approached the player/racket
+    if best_min_dist > 1.85:
+        return None
+
+    return int(best_f)
+
+
+def analyze_proximity_and_events(
+    track_list, wall_corners_px, fps, video_path=None, det_frames=None
+):
+    """
+    1. Smooths trajectory in-place (despiking + Savitzky-Golay).
+    2. Computes 1D Depth-Proximity signal P(t) = z_y(t) + z_d(t) and autocorrelation rally period.
+    3. Detects player turnarounds, snaps ground bounces forward to TRUE racket/wrist contact,
+       filters out phantom mid-air/fence peaks, and pairs each stroke with its true wall impact.
+    """
+    if det_frames is None:
+        det_frames = _CACHED_DET_FRAMES
+
+    # Ensure trajectory is despiked and smoothed even if caller didn't call smooth_ball_trajectory
+    smooth_ball_trajectory(track_list)
+
     N = len(track_list)
-    cx_arr = np.array([t["cx"] for t in track_list], dtype=np.float64)
-    cy_arr = np.array([t["cy"] for t in track_list], dtype=np.float64)
-    d_arr = np.array([t["d"] for t in track_list], dtype=np.float64)
+    idx_arr = np.arange(N)
+    raw_cx = np.array([t["cx"] for t in track_list], dtype=np.float64)
+    raw_cy = np.array([t["cy"] for t in track_list], dtype=np.float64)
+    raw_d = np.array([t["d"] for t in track_list], dtype=np.float64)
 
-    idx_all = np.arange(N)
-    valid_mask = ~np.isnan(cy_arr) & ~np.isnan(d_arr)
-    if np.sum(valid_mask) < 10:
-        raise RuntimeError("Too few tracked ball frames to compute proximity signal.")
+    valid_mask = ~np.isnan(raw_cy) & ~np.isnan(raw_d)
+    if np.sum(valid_mask) < 15:
+        raise RuntimeError(
+            "Insufficient valid ball track points to analyze rally events."
+        )
 
-    cx_interp = np.interp(idx_all, idx_all[valid_mask], cx_arr[valid_mask])
-    cy_interp = np.interp(idx_all, idx_all[valid_mask], cy_arr[valid_mask])
-    d_interp = np.interp(idx_all, idx_all[valid_mask], d_arr[valid_mask])
+    cx_interp = np.interp(idx_arr, idx_arr[valid_mask], raw_cx[valid_mask])
+    cy_interp = np.interp(idx_arr, idx_arr[valid_mask], raw_cy[valid_mask])
+    d_interp = np.interp(idx_arr, idx_arr[valid_mask], raw_d[valid_mask])
+
+    win = max(7, int(round(0.18 * fps)) | 1)
+    cy_s = savgol_filter(cy_interp, window_length=win, polyorder=2)
+    d_s = savgol_filter(d_interp, window_length=win, polyorder=2)
 
     corr_yd = float(np.corrcoef(cy_interp[valid_mask], d_interp[valid_mask])[0, 1])
 
-    z_y = (cy_interp - np.mean(cy_interp[valid_mask])) / max(
-        1e-6, np.std(cy_interp[valid_mask])
-    )
-    z_d = (d_interp - np.mean(d_interp[valid_mask])) / max(
-        1e-6, np.std(d_interp[valid_mask])
-    )
-    raw_prox = z_y + z_d
+    z_y = (cy_s - np.mean(cy_s)) / (np.std(cy_s) + 1e-6)
+    z_d = (d_s - np.mean(d_s)) / (np.std(d_s) + 1e-6)
+    prox_raw = z_y + z_d
+    prox_s = savgol_filter(prox_raw, window_length=win, polyorder=2)
 
-    win = max(5, int(round(0.15 * fps)) | 1)
-    prox_smooth = savgol_filter(raw_prox, window_length=win, polyorder=2)
+    # Autocorrelation for natural rally period
+    p_zero = prox_s - np.mean(prox_s)
+    acf_full = np.correlate(p_zero, p_zero, mode="full")
+    acf = acf_full[N - 1 :] / (acf_full[N - 1] + 1e-6)
 
-    prox_zero = prox_smooth - np.mean(prox_smooth)
-    ac = correlate(prox_zero, prox_zero, mode="full")[N - 1 :]
-    ac = ac / max(1e-6, ac[0])
-
-    min_lag = int(round(0.6 * fps))
+    min_lag = int(round(0.65 * fps))
     max_lag = min(N - 1, int(round(3.0 * fps)))
-    ac_peaks, _ = find_peaks(ac[min_lag:max_lag], prominence=0.08)
-    if len(ac_peaks) > 0:
-        rally_period_frames = int(ac_peaks[0] + min_lag)
+    acf_peaks, _ = find_peaks(acf[min_lag:max_lag], prominence=0.08)
+    if len(acf_peaks) > 0:
+        best_lag = int(acf_peaks[0] + min_lag)
     else:
-        rally_period_frames = int(round(1.5 * fps))
-    rally_period_sec = rally_period_frames / fps
+        best_lag = int(np.argmax(acf[min_lag:max_lag]) + min_lag)
+    rally_period_sec = float(best_lag / fps)
 
-    min_sep = max(6, int(round(0.45 * rally_period_frames)))
+    # Step 1: Detect initial candidate player-side peaks and wall-side troughs
+    min_peak_dist = max(int(round(0.45 * best_lag)), int(round(0.55 * fps)))
+    raw_stroke_peaks, _ = find_peaks(prox_s, distance=min_peak_dist, prominence=0.32)
+    raw_wall_troughs, _ = find_peaks(-prox_s, distance=min_peak_dist, prominence=0.25)
 
-    stroke_cands, _ = find_peaks(prox_smooth, distance=min_sep, prominence=0.35)
-    impact_cands, _ = find_peaks(-prox_smooth, distance=min_sep, prominence=0.35)
+    # Step 2: Snap each candidate peak from the ground bounce to TRUE racket contact
+    # and reject phantom mid-air/fence peaks where the ball isn't near the player
+    snapped_strokes = []
+    for k, p_idx in enumerate(raw_stroke_peaks):
+        p_idx = int(p_idx)
+        # Bound forward search before the next wall trough or next peak
+        next_troughs = [int(w) for w in raw_wall_troughs if w > p_idx + 4]
+        search_limit = next_troughs[0] - 4 if next_troughs else (N - 5)
+        if k + 1 < len(raw_stroke_peaks):
+            search_limit = min(search_limit, int(raw_stroke_peaks[k + 1]) - 4)
 
-    stroke_cands = [int(i) for i in stroke_cands if valid_mask[i]]
-    impact_cands = [int(i) for i in impact_cands if valid_mask[i]]
+        contact_f = snap_bounce_to_racket_contact(
+            p_idx,
+            search_limit,
+            cx_interp,
+            cy_interp,
+            prox_s,
+            det_frames,
+            wall_corners_px,
+            fps,
+        )
+        if contact_f is not None:
+            snapped_strokes.append(contact_f)
 
-    if len(impact_cands) > 0 and len(stroke_cands) > 0:
-        med_wall_d = float(np.median(d_interp[impact_cands]))
-        med_stroke_d = float(np.median(d_interp[stroke_cands]))
-        size_ceiling = med_wall_d + 0.60 * max(2.0, (med_stroke_d - med_wall_d))
-    else:
-        size_ceiling = float("inf")
+    # Deduplicate & enforce minimum physical refractory period between consecutive strokes (>= 0.92s)
+    min_stroke_gap_frames = max(int(round(0.62 * best_lag)), int(round(0.92 * fps)))
+    filtered_strokes = []
+    for s_f in snapped_strokes:
+        if not filtered_strokes:
+            filtered_strokes.append(s_f)
+        else:
+            prev_f = filtered_strokes[-1]
+            if s_f - prev_f < min_stroke_gap_frames:
+                # Keep the candidate where the ball is closer to the player's wrist/racket
+                p_prev = _get_player_wrist_and_racket_info(det_frames, prev_f)
+                p_curr = _get_player_wrist_and_racket_info(det_frames, s_f)
+                d_prev = (
+                    min(
+                        [
+                            math.hypot(cx_interp[prev_f] - tx, cy_interp[prev_f] - ty)
+                            for tx, ty in (p_prev["wrists"] + p_prev["rackets"])
+                        ]
+                        or [999.0]
+                    )
+                    if p_prev
+                    else 999.0
+                )
+                d_curr = (
+                    min(
+                        [
+                            math.hypot(cx_interp[s_f] - tx, cy_interp[s_f] - ty)
+                            for tx, ty in (p_curr["wrists"] + p_curr["rackets"])
+                        ]
+                        or [999.0]
+                    )
+                    if p_curr
+                    else 999.0
+                )
+                if d_curr < d_prev:
+                    filtered_strokes[-1] = s_f
+            else:
+                filtered_strokes.append(s_f)
 
-    wall_poly = np.array(wall_corners, dtype=np.float32)
-    wall_y_max = float(np.max(wall_poly[:, 1])) + 0.15 * (
-        np.max(wall_poly[:, 1]) - np.min(wall_poly[:, 1])
-    )
+    audio_onsets_sec = extract_audio_onsets(video_path)
 
-    valid_impacts = []
-    for imp_idx in impact_cands:
-        if d_interp[imp_idx] <= size_ceiling and cy_interp[imp_idx] <= wall_y_max:
-            valid_impacts.append(imp_idx)
+    wall_arr = np.array(wall_corners_px, dtype=np.float64)
+    wall_cy_min = float(np.min(wall_arr[:, 1])) - 80.0
+    wall_cy_max = float(np.max(wall_arr[:, 1])) + 95.0
 
-    audio_onsets = extract_audio_onsets(video_path, fps) if video_path else np.array([])
+    min_flight_f = max(5, int(round(0.16 * fps)))
+    max_flight_f = int(round(1.15 * fps))
+
     paired_rallies = []
-    max_flight_frames = int(round(1.15 * rally_period_frames))
-    min_flight_frames = max(3, int(round(0.12 * rally_period_frames)))
+    audio_snapped_count = 0
 
-    for k, imp_idx in enumerate(valid_impacts):
-        prev_imp = valid_impacts[k - 1] if k > 0 else -1
-        preceding_strokes = [
-            s
-            for s in stroke_cands
-            if prev_imp < s < imp_idx
-            and min_flight_frames <= (imp_idx - s) <= max_flight_frames
-        ]
-        if not preceding_strokes:
+    # Step 3: Pair each validated racket contact with the true wall bounce trough that follows it
+    for idx_s, s_idx in enumerate(filtered_strokes):
+        next_s_idx = (
+            filtered_strokes[idx_s + 1]
+            if (idx_s + 1 < len(filtered_strokes))
+            else (N - 1)
+        )
+        win_start = s_idx + min_flight_f
+        win_end = min(next_s_idx - 4, s_idx + max_flight_f, N - 2)
+        if win_end <= win_start:
             continue
 
-        s_idx = preceding_strokes[-1]
+        # Look for trough candidates in [win_start, win_end]; fallback to minimum cy_s (highest point on wall)
+        cand_troughs = [int(w) for w in raw_wall_troughs if win_start <= w <= win_end]
+        if cand_troughs:
+            # Pick the deepest wall trough (lowest cy_s + proximity)
+            w_idx = min(cand_troughs, key=lambda w: cy_s[w] + 15.0 * prox_s[w])
+        else:
+            w_idx = int(win_start + np.argmin(cy_s[win_start : win_end + 1]))
 
-        # 1. Visual sub-frame timing via 3-point parabolic interpolation
-        t_stroke_vis = parabolic_subframe(prox_smooth, s_idx)
-        t_impact_vis = parabolic_subframe(-prox_smooth, imp_idx)
+        # Verify that the ball actually reached the upper wall zone at w_idx
+        w_cy = float(cy_interp[w_idx])
+        s_cy = float(cy_interp[s_idx])
+        if not (wall_cy_min <= w_cy <= wall_cy_max):
+            continue
+        if (s_cy - w_cy) < 35.0:
+            # Ball must travel meaningfully upward from the racket to the wall
+            continue
 
-        # 2. Active Audio-Visual Sensor Fusion (snap toward acoustic onset within +-2.5 frames)
-        t_stroke_star, s_snapped = fuse_visual_and_audio_time(
-            t_stroke_vis, audio_onsets, max_window_frames=2.5
+        s_sub = parabolic_subframe(prox_s, s_idx)
+        w_sub = parabolic_subframe(-cy_s, w_idx)
+
+        s_time, s_aud = fuse_visual_and_audio_time(s_sub, fps, audio_onsets_sec)
+        w_time, w_aud = fuse_visual_and_audio_time(w_sub, fps, audio_onsets_sec)
+        if w_time <= s_time + 0.14:
+            continue
+
+        if s_aud or w_aud:
+            audio_snapped_count += 1
+
+        # Measure robust ball pixel diameters around racket contact and wall bounce
+        s_d_slice = raw_d[max(0, s_idx - 2) : min(N, s_idx + 3)]
+        w_d_slice = raw_d[max(0, w_idx - 2) : min(N, w_idx + 3)]
+        s_d_val = (
+            float(np.nanmedian(s_d_slice))
+            if np.any(~np.isnan(s_d_slice))
+            else float(d_interp[s_idx])
         )
-        t_impact_star, w_snapped = fuse_visual_and_audio_time(
-            t_impact_vis, audio_onsets, max_window_frames=2.5
+        w_d_val = (
+            float(np.nanmedian(w_d_slice))
+            if np.any(~np.isnan(w_d_slice))
+            else float(d_interp[w_idx])
         )
-
-        if t_impact_star <= t_stroke_star + 2.0:
-            t_stroke_star, t_impact_star = t_stroke_vis, t_impact_vis
-            s_snapped, w_snapped = False, False
-
-        audio_fused = bool(s_snapped or w_snapped)
-
-        stroke_x = interpolate_at_subframe(cx_interp, t_stroke_star)
-        stroke_y = interpolate_at_subframe(cy_interp, t_stroke_star)
-        stroke_d = interpolate_at_subframe(d_interp, t_stroke_star)
-
-        impact_x = interpolate_at_subframe(cx_interp, t_impact_star)
-        impact_y = interpolate_at_subframe(cy_interp, t_impact_star)
-        impact_d = interpolate_at_subframe(d_interp, t_impact_star)
 
         paired_rallies.append(
             {
                 "shot_number": len(paired_rallies) + 1,
                 "stroke_frame": int(s_idx),
-                "stroke_frame_sub": round(t_stroke_star, 3),
-                "stroke_time_sec": round(t_stroke_star / fps, 3),
-                "stroke_pos_px": [round(stroke_x, 2), round(stroke_y, 2)],
-                "stroke_ball_d_px": round(stroke_d, 2),
-                "impact_frame": int(imp_idx),
-                "impact_frame_sub": round(t_impact_star, 3),
-                "impact_time_sec": round(t_impact_star / fps, 3),
-                "impact_pos_px": [round(impact_x, 2), round(impact_y, 2)],
-                "impact_ball_d_px": round(impact_d, 2),
-                "flight_frames": round(t_impact_star - t_stroke_star, 3),
-                "flight_time_sec": round((t_impact_star - t_stroke_star) / fps, 4),
-                "audio_verified": audio_fused,
-                "audio_snapped_stroke": s_snapped,
-                "audio_snapped_impact": w_snapped,
+                "stroke_subframe": round(float(s_sub), 3),
+                "stroke_time_sec": round(float(s_time), 4),
+                "stroke_pos_px": [
+                    round(float(cx_interp[s_idx]), 2),
+                    round(float(cy_interp[s_idx]), 2),
+                ],
+                "stroke_ball_d_px": round(s_d_val, 2),
+                "stroke_d_px": round(s_d_val, 2),
+                "impact_frame": int(w_idx),
+                "impact_subframe": round(float(w_sub), 3),
+                "impact_time_sec": round(float(w_time), 4),
+                "impact_pos_px": [
+                    round(float(cx_interp[w_idx]), 2),
+                    round(float(cy_interp[w_idx]), 2),
+                ],
+                "impact_ball_d_px": round(w_d_val, 2),
+                "impact_d_px": round(w_d_val, 2),
+                "flight_time_sec": round(float(w_time - s_time), 4),
+                "audio_verified": bool(s_aud or w_aud),
             }
         )
 
     diagnostics = {
-        "corr_y_diameter": round(corr_yd, 3),
-        "rally_period_frames": rally_period_frames,
+        "corr_y_diameter": round(corr_yd, 4),
+        "rally_period_frames": int(best_lag),
         "rally_period_sec": round(rally_period_sec, 3),
-        "audio_onsets_detected": int(len(audio_onsets)),
-        "prox_raw": raw_prox.tolist(),
-        "prox_smooth": prox_smooth.tolist(),
-        "autocorr": ac[:max_lag].tolist(),
+        "audio_onsets_detected": int(len(audio_onsets_sec)),
+        "audio_snapped_shots": int(audio_snapped_count),
+        "proximity_signal": [round(float(x), 4) for x in prox_s],
+        "cy_smoothed": [round(float(x), 2) for x in cy_s],
+        "d_smoothed": [round(float(x), 2) for x in d_s],
+        "acf": [round(float(x), 4) for x in acf[:max_lag]],
     }
     return paired_rallies, diagnostics
 
 
 def save_diagnostic_plot(track_list, paired_rallies, diag, fps, out_png):
+    """Render 3-panel diagnostic figure: Vertical Trajectory, Proximity Signal, and Autocorrelation."""
     N = len(track_list)
-    t_sec = np.arange(N) / fps
-    cy = np.array([t["cy"] for t in track_list])
-    prox = np.array(diag["prox_smooth"])
-    ac = np.array(diag["autocorr"])
-    ac_t = np.arange(len(ac)) / fps
+    t_sec = np.arange(N) / float(fps)
+    cy_s = np.array(diag["cy_smoothed"])
+    prox_s = np.array(diag["proximity_signal"])
+    acf = np.array(diag["acf"])
+    acf_t = np.arange(len(acf)) / float(fps)
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 9), constrained_layout=True)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8.5), constrained_layout=True)
 
-    axes[0].plot(t_sec, cy, color="#1f77b4", lw=1.5, label="Kalman Tracked Ball Y (px)")
+    axes[0].plot(t_sec, cy_s, color="#1f77b4", lw=1.5, label="Smoothed Ball Y (px)")
     axes[0].invert_yaxis()
     axes[0].set_title(
-        "1. Kalman-Tracked Ball Vertical Trajectory (Top = Near Wall, Bottom = Near Racket)"
+        f"1. Ball Vertical Trajectory (y-d Corr = {diag['corr_y_diameter']:+.3f}) | Inverted Y: Top = Wall, Bottom = Player",
+        fontsize=11,
+        fontweight="bold",
     )
     axes[0].set_ylabel("Image Y (px)")
-    axes[0].legend(loc="upper right")
     axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="upper right")
 
     axes[1].plot(
-        t_sec, prox, color="#2ca02c", lw=1.5, label="Proximity Signal (z_y + z_d)"
+        t_sec, prox_s, color="#2ca02c", lw=1.6, label="Proximity Signal (z_y + z_d)"
     )
-    s_times = [r["stroke_time_sec"] for r in paired_rallies]
-    s_vals = [prox[r["stroke_frame"]] for r in paired_rallies]
-    w_times = [r["impact_time_sec"] for r in paired_rallies]
-    w_vals = [prox[r["impact_frame"]] for r in paired_rallies]
-
-    axes[1].scatter(
-        s_times,
-        s_vals,
-        color="red",
-        s=55,
-        zorder=5,
-        label=f"Audio-Visual Fused Strokes ({len(s_times)})",
-    )
-    axes[1].scatter(
-        w_times,
-        w_vals,
-        color="blue",
-        s=55,
-        zorder=5,
-        label=f"Audio-Visual Fused Wall Impacts ({len(w_times)})",
-    )
+    for r in paired_rallies:
+        st_f = r["stroke_frame"]
+        im_f = r["impact_frame"]
+        axes[1].plot(st_f / fps, prox_s[st_f], "ro", ms=7)
+        axes[1].plot(im_f / fps, prox_s[im_f], "bs", ms=6)
+    axes[1].plot([], [], "ro", label="Racket Stroke (Snapped to Wrist/Racket)")
+    axes[1].plot([], [], "bs", label="Wall Impact (Trough)")
     axes[1].set_title(
-        f"2. 1D Depth Proximity Signal (y-d Correlation = {diag['corr_y_diameter']:+.2f} | "
-        f"Measured Rally Period = {diag['rally_period_sec']:.2f}s)"
+        f"2. Combined Depth-Proximity Signal & Validated Rally Pairs (Total = {len(paired_rallies)} shots)",
+        fontsize=11,
+        fontweight="bold",
     )
-    axes[1].set_ylabel("Proximity Z-Score")
-    axes[1].legend(loc="upper right")
+    axes[1].set_ylabel("Z-Score Sum")
     axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="upper right")
 
-    axes[2].plot(ac_t, ac, color="#9467bd", lw=1.8, label="Autocorrelation")
+    axes[2].plot(acf_t, acf, color="#9467bd", lw=1.8, label="Autocorrelation")
     axes[2].axvline(
         diag["rally_period_sec"],
-        color="red",
+        color="#d62728",
         ls="--",
-        lw=1.5,
-        label=f"First Rally Period Peak ({diag['rally_period_sec']:.2f}s)",
+        lw=2.0,
+        label=f"Rally Period = {diag['rally_period_sec']:.2f}s ({diag['rally_period_frames']} frames)",
     )
     axes[2].set_title(
-        "3. Proximity Signal Autocorrelation (Dynamic Rally Period Estimation)"
+        "3. Autocorrelation Rally Period Estimation", fontsize=11, fontweight="bold"
     )
     axes[2].set_xlabel("Lag Time (seconds)")
-    axes[2].set_ylabel("Correlation")
-    axes[2].legend(loc="upper right")
+    axes[2].set_ylabel("Normalized ACF")
     axes[2].grid(True, alpha=0.3)
+    axes[2].legend(loc="upper right")
 
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
-    plt.savefig(out_png, dpi=150)
+    fig.savefig(out_png, dpi=150)
     plt.close(fig)
 
 
@@ -589,23 +834,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     clip_name = os.path.splitext(os.path.basename(args.video))[0]
-    quad_file = f"cache/{clip_name}_wall_quad.json"
     det_cache_file = f"cache/{clip_name}_detections.json"
+    quad_file = f"cache/{clip_name}_wall_quad.json"
     out_track_file = f"cache/{clip_name}_tracks_and_events.json"
     out_plot_file = f"outputs/{clip_name}_diagnostics.png"
 
-    with open(quad_file, "r") as f:
-        quad_data = json.load(f)
     with open(det_cache_file, "r") as f:
-        det_data = json.load(f)
+        det_payload = json.load(f)
+    with open(quad_file, "r") as f:
+        quad_payload = json.load(f)
 
-    fps = det_data["fps"]
-    width = det_data["width"]
-    height = det_data["height"]
-    total_frames = det_data["total_frames"]
+    fps = det_payload["fps"]
+    width = det_payload["width"]
+    height = det_payload["height"]
+    total_frames = det_payload["total_frames"]
 
     cleaned_balls, removed_static, kept_dynamic = suppress_static_balls(
-        det_data["frames"], fps
+        det_payload["frames"], fps
     )
 
     tracker = AsymmetricBallKalmanTracker(width, height, fps)
@@ -616,16 +861,47 @@ if __name__ == "__main__":
         track_list.append(state)
 
     track_list = smooth_ball_trajectory(track_list)
+
     tracked_count = sum(1 for t in track_list if t["tracked"])
     coasted_count = sum(1 for t in track_list if t["coasted"])
 
     paired_rallies, diag = analyze_proximity_and_events(
-        track_list, quad_data["wall_corners_px"], fps, video_path=args.video
+        track_list,
+        quad_payload["wall_corners_px"],
+        fps,
+        video_path=args.video,
+        det_frames=det_payload["frames"],
     )
-
     save_diagnostic_plot(track_list, paired_rallies, diag, fps, out_plot_file)
 
-    output_payload = {
+    print("\n" + "=" * 74)
+    print("PASS 2A: BALL TRACKING & RACKET-SNAPPED RALLY EVENT SUMMARY")
+    print("=" * 74)
+    print(
+        f"Static / Invalid Boxes Dropped     : {removed_static} (Kept {kept_dynamic} moving candidates)"
+    )
+    print(
+        f"Kalman Track Coverage              : {tracked_count}/{total_frames} frames ({100.0 * tracked_count / max(1, total_frames):.1f}% | Coasted: {coasted_count})"
+    )
+    print(
+        f"Ball Y vs. Diameter Correlation    : {diag['corr_y_diameter']:+.3f} (README ref: +0.660)"
+    )
+    print(
+        f"Autocorrelation Rally Period       : {diag['rally_period_sec']:.2f} sec ({diag['rally_period_frames']} frames)"
+    )
+    print(
+        f"Audio-Visual Fused Contacts        : {diag['audio_snapped_shots']}/{len(paired_rallies)} shots snapped to acoustic transients"
+    )
+    print("-" * 74)
+    for r in paired_rallies:
+        tag = "AUD+VIS" if r["audio_verified"] else "VIS-ONLY"
+        print(
+            f"  Shot #{r['shot_number']:02d} [{tag}] | Stroke @ {r['stroke_time_sec']:5.2f}s (d={r['stroke_d_px']:4.1f}px) "
+            f"--> Wall @ {r['impact_time_sec']:5.2f}s (d={r['impact_d_px']:4.1f}px) | Flight: {r['flight_time_sec'] * 1000:4.0f} ms"
+        )
+    print("=" * 74)
+
+    out_payload = {
         "clip_name": clip_name,
         "fps": fps,
         "width": width,
@@ -638,37 +914,8 @@ if __name__ == "__main__":
         "rallies": paired_rallies,
         "ball_track": track_list,
     }
+    os.makedirs(os.path.dirname(out_track_file), exist_ok=True)
     with open(out_track_file, "w") as f:
-        json.dump(output_payload, f, indent=2)
-
-    audio_fused_count = sum(1 for r in paired_rallies if r["audio_verified"])
-
-    print("\n" + "=" * 74)
-    print("PASS 2A: BALL TRACKING & AUDIO-VISUAL RALLY EVENT SUMMARY")
-    print("=" * 74)
-    print(
-        f"Static / Invalid Boxes Dropped      : {removed_static} (Kept {kept_dynamic} moving candidates)"
-    )
-    print(
-        f"Kalman Track Coverage               : {tracked_count}/{total_frames} frames ({100 * tracked_count / total_frames:.1f}% | Coasted: {coasted_count})"
-    )
-    print(
-        f"Ball Y vs. Diameter Correlation     : {diag['corr_y_diameter']:+.3f} (README ref: +0.660)"
-    )
-    print(
-        f"Autocorrelation Rally Period        : {diag['rally_period_sec']:.2f} sec ({diag['rally_period_frames']} frames)"
-    )
-    print(
-        f"Audio-Visual Fused Contacts         : {audio_fused_count}/{len(paired_rallies)} shots snapped to acoustic transients"
-    )
-    print("-" * 74)
-    for r in paired_rallies[:12]:
-        aud_tag = "[AUD+VIS]" if r["audio_verified"] else "[VIS-ONLY]"
-        print(
-            f"  Shot #{r['shot_number']:02d} {aud_tag} | Stroke @ {r['stroke_time_sec']:5.2f}s (d={r['stroke_ball_d_px']:4.1f}px) "
-            f"--> Wall @ {r['impact_time_sec']:5.2f}s (d={r['impact_ball_d_px']:4.1f}px) | "
-            f"Flight: {r['flight_time_sec'] * 1000:4.0f} ms"
-        )
-    print("=" * 74)
+        json.dump(out_payload, f, indent=2)
     print(f"[Saved] Track & Events JSON : {out_track_file}")
     print(f"[Saved] Diagnostic Plot PNG : {out_plot_file}")

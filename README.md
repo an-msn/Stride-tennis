@@ -37,8 +37,13 @@
 stride-tennis/
 │
 ├── run_pipeline.py                  # Master 1-command runner executing Pass 0 through Pass 3
-├── README.md                        # project documentation
+├── requirements.txt                 # Reproducible Python package dependencies
+├── .gitignore                       # Excludes raw videos, .pt weights, runs/, and cache/*.json
+├── README.md                        # Project documentation
 │
+├── assets/                          # Curated lightweight outputs tracked in Git for showcase
+│   ├── sample_diagnostics.png       # 3-panel trajectory, proximity wave & autocorrelation plot
+│   └── sample_metrics.csv           # Validated shot speeds, wall UV coords & posture cues
 ├── data/
 │   ├── raw_videos/
 │   │   └── sample.mp4               # Input raw tennis wall-practice video
@@ -134,9 +139,9 @@ Why does this pipeline work from a single camera when 3D depth ($Z$) is normally
 
 ### Pass 2A: Static Suppression, Kalman Tracking & 1D Depth Signal (`02_track_and_detect_events.py`)
 
-#### 1. Pre-Tracking Static Scenery Filter & Physical Size Gate
-* **Static Bucket Suppression:** Pale marks on the wall or court background often look like tennis balls to a neural network. Before tracking starts, the script divides the frame into $8 \times 8\text{ px}$ spatial buckets. Any bucket holding detections for $\ge 0.8\text{ seconds}$ is flagged as static scenery and deleted.
-* **Physical Size Gate:** In $1080\text{p}$ footage, a tennis ball cannot exceed $45\text{ px}$ in minor-axis diameter. Dropping boxes with $\min(w, h) > 45\text{ px}$ eliminates false positives on white tennis shoes or racket heads.
+#### 1. Pre-Tracking Static Scenery Filter, Physical Size Gate & Shoe Masking
+* **Static Bucket Suppression:** Pale marks on the wall or court background often look like tennis balls to a neural network. Before tracking starts, the script divides the frame into $8 \times 8\text{ px}$ spatial buckets[cite: 7, 9]. Any bucket holding detections for $\ge 0.8\text{ seconds}$ is flagged as static scenery and deleted[cite: 7, 9].
+* **Physical Size Gate & Ankle/Shoe Masking:** In $1080\text{p}$ footage, a tennis ball cannot exceed $45\text{ px}$ in minor-axis diameter[cite: 7, 9]. Dropping oversize boxes ($\min(w, h) > 45\text{ px}$) and masking out low-confidence detections within $38\text{ px}$ of the player's ankles (`kp 15, 16`) eliminates false positives on white tennis shoes and racket heads[cite: 7].
 
 #### 2. 4-Rule Asymmetric Kalman Filter with Gravity Bias
 A **Kalman Filter** *[linear quadratic state estimation]* maintains a 4D state vector $\mathbf{x}_k = [c_x, c_y, v_x, v_y]^T$ (position and velocity) and predicts where the ball should appear in the next frame, governed by four domain rules:
@@ -145,22 +150,22 @@ A **Kalman Filter** *[linear quadratic state estimation]* maintains a 4D state v
 3. **Gravity-Biased Coasting:** If the ball disappears in motion blur during racket contact, the filter coasts on its prediction for up to $8\text{ frames}$ while applying a downward gravitational acceleration prior ($+g_y$).
 4. **Frame-Bounds Termination:** If a coasting prediction exits the $1920 \times 1080$ frame boundaries, the track resets immediately.
 
-#### 3. Blur-Compensated Minor-Axis Ball Sizing
-* **The Problem:** During fast flight, shutter **Motion Blur** *[exposure streak along motion]* stretches the ball into an elongated pill shape along its velocity vector, artificially inflating its bounding-box width or height.
-* **The Principle:** Whenever ball speed exceeds $8\text{ px/frame}$, the script uses $\min(w, h)$ (the minor axis perpendicular to motion, which is unaffected by directional blur) as the true apparent pixel diameter $d$.
+#### 3. 3D-Aware Multi-Frame Contact & Takeback Stroke Classifier
+* **Why Single-Frame Midlines Fail on Diagonal Cameras:** When filmed from a diagonal angle behind the baseline, an out-in-front backhand contact point can project horizontally to the right of the player's 2D hip/torso midline.
+* **4-Cue Kinematic Fusion:** Combines (1) the ball's contact offset (`45%`), (2) the hitting wrist and dominant-shoulder vector across the `[-4, +2]` contact window (`30%`, including two-handed backhand wrist coupling), (3) the `tennis-racket` bounding box offset (`15%`), and (4) the `[-10, -2]` pre-contact **Takeback Coiling Window** (`10%`, tracking the wrist and elbow coiling across the chest) for accurate Forehand/Backhand classification[cite: 8].
 
-#### 4. Zero-Phase Savitzky-Golay Trajectory Smoothing
-* Bridges tiny $1\text{--}4\text{ frame}$ coasting gaps via linear interpolation and runs a bidirectional **Savitzky-Golay Filter** *[local polynomial least-squares smoothing]* (`window_length=7, polyorder=2`) over $(c_x, c_y, d)$ to remove single-frame bounding-box jitter while preserving sharp turnaround peaks.
+#### 4. Spatial Outlier Despiking & Zero-Phase Savitzky-Golay Smoothing
+* **Outlier Despiker:** Rejects isolated $1\text{--}2\text{ frame}$ spatial teleport spikes ($> 95\text{ px}$ jump from neighboring frames) caused by court glints[cite: 7].
+* **Savitzky-Golay Smoothing:** Bridges tiny $1\text{--}4\text{ frame}$ coasting gaps via linear interpolation and runs a bidirectional **Savitzky-Golay Filter** *[local polynomial least-squares smoothing]* (`window_length=7, polyorder=2`) over $(c_x, c_y, d)$ to remove bounding-box jitter while preserving sharp turnaround peaks[cite: 7, 9].
 
-#### 5. 1D Depth-Proximity Wave & Autocorrelation Rally Period
+#### 5. 1D Depth-Proximity Wave, Ground-Bounce Snapping & Autocorrelation
 * **Combining Two Monocular Depth Cues:** Because the camera sits behind and slightly beside the player:
-  * **Near the Racket:** The ball is **low in the image** (large vertical pixel coordinate $c_y$) and **physically close to the lens** (large pixel diameter $d$).
-  * **At the Wall:** The ball is **high in the image** (small $c_y$) and **far from the lens** (small $d$).
-* **Z-Score Fusion:** Standardizing both signals into dimensionless **Z-Scores** *[zero-mean unit-variance normalization]* and adding them together yields a clean 1D Depth-Proximity wave $P(t)$:
+  * **Near the Player:** The ball is **low in the image** (large vertical pixel coordinate $c_y$) and **physically close to the lens** (large pixel diameter $d$)[cite: 9].
+  * **At the Wall:** The ball is **high in the image** (small $c_y$) and **far from the lens** (small $d$)[cite: 9].
+* **Z-Score Fusion:** Standardizing both signals into dimensionless **Z-Scores** *[zero-mean unit-variance normalization]* and adding them together yields a clean 1D Depth-Proximity wave $P(t)$[cite: 7, 9]:
   $$z_y(t) = \frac{c_y(t) - \mu_y}{\sigma_y}, \quad z_d(t) = \frac{d(t) - \mu_d}{\sigma_d}, \quad P(t) = z_y(t) + z_d(t)$$
-  * **Local Maxima (Peaks) of $P(t)$** $=$ Racket Strokes.
-  * **Local Minima (Troughs) of $P(t)$** $=$ Wall Impacts.
-* **Dynamic Rally Period via Autocorrelation:** Rather than hardcoding how fast a player rallies, the script computes the normalized **Autocorrelation** *[signal cross-correlated with itself]* of $P(t)$. The first prominent peak between $0.6\text{ s}$ and $3.0\text{ s}$ gives the clip's natural rally period $T_{\text{rally}}$ (e.g., $1.58\text{ s}$).
+* **Ground-Bounce $\rightarrow$ True Racket-Contact Snapping (`snap_bounce_to_racket_contact`):** In wall practice, the ball hits the court floor (reaching maximum $c_y$) $\approx 0.25\text{--}0.45\text{ s}$ *before* rising to waist height where the racket strikes it[cite: 7]. Scanning forward from each $P(t)$ peak locks `stroke_frame` onto the exact frame where the ball comes closest to the player's wrists (`kp 9, 10`) or `tennis-racket` box and launches upward toward the wall, while rejecting phantom mid-air/fence peaks outside physical reach ($> 1.85\times$ spine length)[cite: 7].
+* **Dynamic Rally Period via Autocorrelation:** Rather than hardcoding how fast a player rallies, the script computes the normalized **Autocorrelation** *[signal cross-correlated with itself]* of $P(t)$[cite: 7, 9]. The first prominent peak between $0.65\text{ s}$ and $3.0\text{ s}$ gives the clip's natural rally period $T_{\text{rally}}$ and enforces a $\ge 0.92\text{ s}$ physical refractory gap between strokes[cite: 7].
 
 #### 6. 3-Point Parabolic Sub-Frame Timing & Active Audio-Visual Fusion
 * **Sub-Frame Parabolic Fit:** Even at $60\text{ FPS}$, the ball travels $\approx 25\text{ cm}$ between frames. Fitting a parabola through the 3 samples $(s_{-1}, s_0, s_{+1})$ around each peak locates the exact sub-frame turnaround timestamp $t^*$:
